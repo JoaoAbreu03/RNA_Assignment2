@@ -148,3 +148,4 @@ L.plot_test_predictions(DM, PM, EsM, refM, N, figDir);
 fclose(fidT);
 fprintf('\nTabelas em %s | figuras em %s\n', fullfile(resDir, 'tabelas.txt'), figDir);
 
+diary off                          % fecha a copia do ecra (output_main.txt)
