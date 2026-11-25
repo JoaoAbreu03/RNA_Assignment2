@@ -4,7 +4,6 @@ L = ann_lib();
 
 %  Config inicial
 SEED  = 42;                        
-QUICK = false;                     % true: so 2 runs nas experiencias finais (teste do codigo)
 rand('state', SEED);  randn('state', SEED);
 
 fracs = [0.70 0.15 0.15];          % treino / validacao / teste
@@ -19,16 +18,15 @@ lrGrid.adam = 10 .^ (-4:0.5:-1.5);
 tuneSeeds   = SEED + (0:4);
 
 % Experiencias finais: a run k usa a seed k 
-if QUICK, finalSeeds = 1:2; else finalSeeds = 1:30; end
+finalSeeds = 1:30;
 
-% Pastas e ficheiros. O tuning e as experiencias sao gravados depois de cada
-% configuracao/run: se o script for interrompido, continua onde parou.
+% Pastas e ficheiros de saida: tabelas, progresso e copia do ecra.
+% Cada execucao comeca de raiz (nada e carregado de execucoes anteriores).
 figDir = 'figuras';
 resDir = 'resultados';
 if ~exist(resDir, 'dir'), mkdir(resDir); end
-tuneFile = fullfile(resDir, 'tuning.mat');
-if QUICK, finalFile = fullfile(resDir, 'final_quick.mat'); else finalFile = fullfile(resDir, 'final.mat'); end
 logFile  = fullfile(resDir, 'progresso.txt');
+if exist(logFile, 'file'), delete(logFile); end     % o log e acrescentado a cada passo
 fidT = fopen(fullfile(resDir, 'tabelas.txt'), 'w');
 outFile = fullfile(resDir, 'output_main.txt');      % copia de tudo o que sai no ecra
 if exist(outFile, 'file'), delete(outFile); end
@@ -41,7 +39,9 @@ fprintf('  Mini-batch (GD e Adam): B = %d | Adam: beta1 = %.3f, beta2 = %.3f, ep
 fprintf(['  BFGS: line search de backtracking (Armijo, c1 = %.0e), passo inicial 1, divide por 2,\n' ...
          '        max. %d tentativas | tolerancia do gradiente ||g|| < %.0e | max. iteracoes = %g\n' ...
          '        (o limite efetivo e o orcamento em epoch-equivalentes) | H inicial = I, escalada\n' ...
-         '        por s''y/y''y na 1a iteracao | atualizacao so se s''y > 1e-10\n'], ...
+         '        por s''y/y''y na 1a iteracao | atualizacao so se s''y > 1e-10*||s||*||y||\n' ...
+         '        | se a line search falha com H != I, H volta a I e tenta-se com -g (so para se falhar tambem\n' ...
+         '        com -g)\n'], ...
         oB.c1, oB.maxLS, oB.gradTol, oB.maxIter);
 
 
@@ -85,10 +85,10 @@ refC = L.fit_baseline_models(DC, PC);
 L.check_architectures_and_gradients(DC, PC, N, SEED);
 
 %% 9 Afinacao do learning rate (validacao)
-LRC = L.tune_learning_rates(DC, PC, lrGrid, tuneSeeds, tuneFile, logFile, figDir, N);
+LRC = L.tune_learning_rates(DC, PC, lrGrid, tuneSeeds, logFile, figDir, N);
 
 %% 10 Experiencias finais (o teste so e usado a partir daqui)
-EsC = L.run_final_experiments(DC, PC, LRC, finalSeeds, finalFile, logFile, N);
+EsC = L.run_final_experiments(DC, PC, LRC, finalSeeds, logFile, N);
 
 %% 11 Resultados e avaliacao no teste
 refC = L.evaluate_baseline_models(DC, refC, PC, fidT);
@@ -135,10 +135,10 @@ refM = L.fit_baseline_models(DM, PM);
 L.check_architectures_and_gradients(DM, PM, N, SEED);
 
 %% 9 Afinacao do learning rate (validacao)
-LRM = L.tune_learning_rates(DM, PM, lrGrid, tuneSeeds, tuneFile, logFile, figDir, N);
+LRM = L.tune_learning_rates(DM, PM, lrGrid, tuneSeeds, logFile, figDir, N);
 
 %% 10 Experiencias finais (o teste so e usado a partir daqui)
-EsM = L.run_final_experiments(DM, PM, LRM, finalSeeds, finalFile, logFile, N);
+EsM = L.run_final_experiments(DM, PM, LRM, finalSeeds, logFile, N);
 
 %% 11 Resultados e avaliacao no teste
 refM = L.evaluate_baseline_models(DM, refM, PM, fidT);
@@ -148,6 +148,3 @@ L.plot_test_predictions(DM, PM, EsM, refM, N, figDir);
 fclose(fidT);
 fprintf('\nTabelas em %s | figuras em %s\n', fullfile(resDir, 'tabelas.txt'), figDir);
 
-%% grava o ficheiro 
-
-diary off

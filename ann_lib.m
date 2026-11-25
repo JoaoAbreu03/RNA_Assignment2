@@ -95,8 +95,6 @@ L.print_and_log                       = @print_and_log;
 
 % 9. EXPERIENCIAS FINAIS
 L.train_algorithm_runs                = @train_algorithm_runs;
-L.save_result_to_mat                  = @save_result_to_mat;
-L.load_results_from_mat               = @load_results_from_mat;
 
 % 10. RESULTADOS
 L.plot_training_curves                = @plot_training_curves;
@@ -112,7 +110,6 @@ L.plot_residual_histogram             = @plot_residual_histogram;
 L.check_architectures_and_gradients   = @check_architectures_and_gradients;
 L.tune_learning_rates                 = @tune_learning_rates;
 L.run_final_experiments               = @run_final_experiments;
-L.save_algorithm_result               = @save_algorithm_result;
 L.report_results                      = @report_results;
 L.print_algorithm_comparison          = @print_algorithm_comparison;
 L.time_to_reach_best_val              = @time_to_reach_best_val;
@@ -1515,11 +1512,15 @@ function [theta, hist] = train_bfgs(theta0, layers, Xtr, ytr, Xva, yva, opts)
 %  - line search de backtracking com a condicao de Armijo:
 %      J(theta + a*d) <= J(theta) + c1 * a * g'*d,  a = 1, 1/2, 1/4, ...
 %    (c1 = opts.c1, no maximo opts.maxLS tentativas)
-%  - atualizacao BFGS de H (so se s'*y > 0, para H continuar definida positiva),
-%    escrita em O(p^2):  H <- H + (s'y + y'Hy)/(s'y)^2 * s*s' - (Hy*s' + s*(Hy)')/(s'y)
+%  - se a line search falha com H != I, H volta a identidade (e a escala da
+%    1a iteracao repete-se) e tenta-se de novo na direcao -g; so se falhar
+%    tambem com -g e que o treino para
+%  - atualizacao BFGS de H (so se s'*y > 1e-10*||s||*||y||, para H continuar
+%    definida positiva), escrita em O(p^2):  H <- H + (s'y + y'Hy)/(s'y)^2 * s*s' - (Hy*s' + s*(Hy)')/(s'y)
 %  - na 1a iteracao H e escalada por s'y / y'y antes da atualizacao
 %  - para quando: orcamento esgotado, ||g|| < opts.gradTol, opts.maxIter
 %    iteracoes feitas (por omissao Inf: manda o orcamento), ou line search falha
+%    mesmo com a direcao do gradiente
 % Cada avaliacao de perda+gradiente no treino completo custa 1 epoch-equivalente.
 % hist.nIter = numero de iteracoes BFGS (passos aceites).
 opts = fill_default_options(opts);
@@ -1534,6 +1535,7 @@ cost = 1;                                         % avaliacoes ja gastas
 hist.nGrad = 1;
 last = 1;                                        % ultimo indice preenchido
 firstIt = true;
+hIsI = true;                                     % H e a identidade?
 hist.nIter = 0;
 while cost < opts.budget
     if norm(g) < opts.gradTol
@@ -1545,7 +1547,7 @@ while cost < opts.budget
     d = -H * g;
     gd = g' * d;
     if gd >= 0
-        H = eye(p);  d = -g;  gd = g' * d;
+        H = eye(p);  hIsI = true;  firstIt = true;  d = -g;  gd = g' * d;
     end
     a = 1;  ok = false;
     for ls = 1:opts.maxLS
@@ -1560,19 +1562,24 @@ while cost < opts.budget
         a = a / 2;
     end
     if ~ok
-        if cost >= opts.budget, hist.stop = 'budget'; else hist.stop = 'linesearch'; end
-        break;
+        if cost >= opts.budget, hist.stop = 'budget'; break; end
+        if ~hIsI                      % H pode estar mal condicionada: recomeca com -g
+            H = eye(p);  hIsI = true;  firstIt = true;
+            continue;
+        end
+        hist.stop = 'linesearch';  break;     % falhou ate com a direcao do gradiente
     end
     s = thetaNew - theta;
     yk = gn - g;
     sy = s' * yk;
-    if sy > 1e-10
+    if sy > 1e-10 * norm(s) * norm(yk)
         if firstIt
             H = (sy / (yk' * yk)) * eye(p);
             firstIt = false;
         end
         Hy = H * yk;
         H = H + ((sy + yk' * Hy) / sy ^ 2) * (s * s') - (Hy * s' + s * Hy') / sy;
+        hIsI = false;
     end
     theta = thetaNew;  J = Jn;  g = gn;
     hist.nIter = hist.nIter + 1;
@@ -1710,13 +1717,11 @@ end
 %  9. EXPERIENCIAS FINAIS (30 runs por combinacao)
 % =====================================================================
 
-function S = train_algorithm_runs(alg, layers, P, lr, budget, seeds, S, saveFn, logFile, unit)
+function S = train_algorithm_runs(alg, layers, P, lr, budget, seeds, logFile, unit)
 % Treina UM algoritmo (alg = 'gd', 'adam' ou 'bfgs') numa arquitetura, uma vez
 % por seed. Run k: pesos iniciais init_params(layers, seeds(k)) e ordem dos
 % mini-batches com a mesma seed -> os 3 algoritmos partem dos MESMOS pesos em
 % cada run (comparacao emparelhada), qualquer que seja a ordem em que correm.
-%   S : resultados parciais (para continuar) ou [].  saveFn(S) grava depois de
-%       cada run (se o script for interrompido, continua onde parou).
 % Campos de S (nRuns = numel(seeds)):
 %   train, val, time   : (budget+1) x nRuns  (MSE normalizado / segundos)
 %   rmse, mse, mae, r2 : 1 x nRuns  (teste, unidades originais)
@@ -1724,15 +1729,13 @@ function S = train_algorithm_runs(alg, layers, P, lr, budget, seeds, S, saveFn, 
 %   yhat : nTeste x nRuns (previsoes no teste, unidades originais)
 %   done : numero de runs ja feitas
 nR = numel(seeds);
-if isempty(S)
-    S.train = nan(budget + 1, nR);  S.val = nan(budget + 1, nR);  S.time = nan(budget + 1, nR);
-    S.rmse = nan(1, nR);  S.mse = nan(1, nR);  S.mae = nan(1, nR);  S.r2 = nan(1, nR);
-    S.nGrad = nan(1, nR);  S.elapsed = nan(1, nR);  S.bestEpoch = nan(1, nR);
-    S.bestVal = nan(1, nR);  S.failed = false(1, nR);
-    S.yhat = nan(numel(P.yteRaw), nR);
-    S.done = 0;
-end
-for r = S.done + 1:nR
+S.train = nan(budget + 1, nR);  S.val = nan(budget + 1, nR);  S.time = nan(budget + 1, nR);
+S.rmse = nan(1, nR);  S.mse = nan(1, nR);  S.mae = nan(1, nR);  S.r2 = nan(1, nR);
+S.nGrad = nan(1, nR);  S.elapsed = nan(1, nR);  S.bestEpoch = nan(1, nR);
+S.bestVal = nan(1, nR);  S.failed = false(1, nR);
+S.yhat = nan(numel(P.yteRaw), nR);
+S.done = 0;
+for r = 1:nR
     th0 = init_params(layers, seeds(r));
     o = fill_default_options(struct('budget', budget, 'seed', seeds(r), 'lr', lr));
     [th, h] = train_with_algorithm(alg, th0, layers, P, o);
@@ -1743,30 +1746,10 @@ for r = S.done + 1:nR
     S.nGrad(r) = h.nGrad;  S.elapsed(r) = h.elapsed;  S.bestEpoch(r) = h.bestEpoch;
     S.bestVal(r) = h.bestVal;  S.failed(r) = h.failed;  S.yhat(:, r) = yh;
     S.done = r;
-    saveFn(S);
     msg = sprintf('    run %2d/%d: RMSE teste %.3f %s | R2 %.3f | melhor epoch %4d | %6.1f s', ...
                   r, nR, m.rmse, unit, m.r2, h.bestEpoch, h.elapsed);
     if h.failed, msg = [msg '  [divergiu]']; end
     print_and_log(logFile, msg);
-end
-end
-
-
-function save_result_to_mat(file, varName, key, E)
-% Guarda E em varName.(key) dentro do ficheiro .mat, sem apagar o resto
-% (ex.: TUNE.Concrete_A_gd ou FINAL.Melbourne_C).
-if exist(file, 'file'), S = load(file); else S = struct(); end
-if ~isfield(S, varName), S.(varName) = struct(); end
-S.(varName).(key) = E;
-save(file, '-struct', 'S');
-end
-
-function S = load_results_from_mat(file, varName)
-% Le varName do ficheiro .mat (estrutura vazia se nao existir).
-S = struct();
-if exist(file, 'file')
-    F = load(file);
-    if isfield(F, varName), S = F.(varName); end
 end
 end
 
@@ -1969,18 +1952,16 @@ for a = 1:3
 end
 end
 
-function LRd = tune_learning_rates(D, P, lrGrid, seeds, tuneFile, logFile, figDir, N)
+function LRd = tune_learning_rates(D, P, lrGrid, seeds, logFile, figDir, N)
 % Afinacao do learning rate de GD e Adam nas 3 arquiteturas, so com o
 % conjunto de validacao (orcamento = cfg.budget). Se o escolhido ficar no limite
 % da grelha, acrescenta-se um valor nesse sentido (fator sqrt(10)), no maximo 2
-% vezes. Resultados em tuneFile (TUNE.<nome>_<arq>_<alg>); o que ja la esta nao
-% volta a ser corrido.
+% vezes.
 % LRd(a, g) : learning rate escolhido (a = A,B,C; g = 1 GD, 2 Adam).
 archs = get_architecture_ids();
 [algs, nmAlg] = get_algorithm_list();
 algs = algs(1:2);  nmAlg = nmAlg(1:2);           % so GD e Adam tem learning rate
 budget = get_config_field(D.cfg, 'budget', 1000);
-TUNE = load_results_from_mat(tuneFile, 'TUNE');
 o = fill_default_options(struct('budget', budget));
 LRd = zeros(3, 2);
 Rs = cell(3, 2);
@@ -1989,16 +1970,9 @@ for g = 1:2                                   % por algoritmo: GD (A, B, C), dep
     for a = 1:3
         lay = get_architecture_layers(archs{a}, P.d, N);
         key = sprintf('%s_%s_%s', D.name, archs{a}, algs{g});
-        if isfield(TUNE, key)
-            R = TUNE.(key);
-            print_and_log(logFile, sprintf('  %s: ja afinado (carregado de %s), lr escolhido %.0e', ...
-                    key, tuneFile, R.lrBest));
-        else
-            print_and_log(logFile, sprintf('Tuning %s (budget %d)', key, budget));
-            R = tune_learning_rate(algs{g}, lay, P, lrGrid.(algs{g}), seeds, o, logFile);
-            save_result_to_mat(tuneFile, 'TUNE', key, R);
-        end
-        if ~isfield(R, 'nExt'), R.nExt = 0; end
+        print_and_log(logFile, sprintf('Tuning %s (budget %d)', key, budget));
+        R = tune_learning_rate(algs{g}, lay, P, lrGrid.(algs{g}), seeds, o, logFile);
+        R.nExt = 0;
         while R.edge && R.nExt < 2
             if R.best == 1, newLr = R.lrs(1) / sqrt(10); else newLr = R.lrs(end) * sqrt(10); end
             print_and_log(logFile, sprintf('Grelha alargada %s: lr = %.2e', key, newLr));
@@ -2006,7 +1980,6 @@ for g = 1:2                                   % por algoritmo: GD (A, B, C), dep
             nExt = R.nExt + 1;
             R = merge_tuning_results(R, R2);
             R.nExt = nExt;
-            save_result_to_mat(tuneFile, 'TUNE', key, R);
         end
         Rs{a, g} = R;
         LRd(a, g) = R.lrBest;
@@ -2033,45 +2006,30 @@ plot_learning_rate_tuning(Rs(:, 1)', Rs(:, 2)', archNames, ['Afinacao do learnin
 save_figure_png(['tuning_' lower(D.name)], figDir);
 end
 
-function Es = run_final_experiments(D, P, LRd, seeds, finalFile, logFile, N)
+function Es = run_final_experiments(D, P, LRd, seeds, logFile, N)
 % Experiencias finais de um dataset, por esta ordem:
 %   para cada algoritmo (GD, Adam, BFGS)
 %     para cada arquitetura (A, B, C)
 %       numel(seeds) runs  (orcamento = cfg.budget)
 % Mostra um cabecalho e um resumo de cada bloco. Es{a}.(alg) = resultados da
-% arquitetura a com esse algoritmo (ver train_algorithm_runs). Grava em finalFile
-% (FINAL.<nome>_<arq>.<alg>) depois de cada run; o que ja esta feito e
-% carregado e nao volta a correr.
+% arquitetura a com esse algoritmo (ver train_algorithm_runs).
 archs = get_architecture_ids();
 [algs, nmAlg] = get_algorithm_list();
 budget = get_config_field(D.cfg, 'budget', 1000);
-nR = numel(seeds);
-FINAL = load_results_from_mat(finalFile, 'FINAL');
 Es = cell(1, 3);
 for a = 1:3
-    key = sprintf('%s_%s', D.name, archs{a});
-    if isfield(FINAL, key), Es{a} = FINAL.(key); else Es{a} = struct(); end
+    Es{a} = struct();
     Es{a}.seeds = seeds;  Es{a}.lrs = LRd(a, :);  Es{a}.budget = budget;
     Es{a}.layers = get_architecture_layers(archs{a}, P.d, N);
 end
 for g = 1:3
     print_and_log(logFile, sprintf('\n######## %s - %s ########', D.name, nmAlg{g}));
     for a = 1:3
-        key = sprintf('%s_%s', D.name, archs{a});
         [lay, nmArch] = get_architecture_layers(archs{a}, P.d, N);
         if g < 3, lrTxt = sprintf('lr %.0e', LRd(a, g)); lr = LRd(a, g); else lrTxt = 'line search'; lr = []; end
         print_and_log(logFile, sprintf('=== %s | %s | %s (%d parametros, %s, orcamento %d) ===', ...
                 D.name, nmAlg{g}, nmArch, count_params(lay), lrTxt, budget));
-        if isfield(Es{a}, algs{g}), S = Es{a}.(algs{g}); else S = []; end
-        if ~isempty(S) && ~isfield(S, 'done')
-            S.done = Es{a}.done;               % resultados gravados pela versao anterior
-        end
-        if ~isempty(S) && S.done >= nR
-            print_and_log(logFile, sprintf('    %d/%d runs ja feitas (carregadas de %s)', S.done, nR, finalFile));
-        else
-            saveFn = @(Sx) save_algorithm_result(finalFile, key, algs{g}, Sx, Es{a});
-            S = train_algorithm_runs(algs{g}, lay, P, lr, budget, seeds, S, saveFn, logFile, D.unit);
-        end
+        S = train_algorithm_runs(algs{g}, lay, P, lr, budget, seeds, logFile, D.unit);
         Es{a}.(algs{g}) = S;
         v = S.rmse(~isnan(S.rmse));
         print_and_log(logFile, sprintf(['    -> RMSE teste: mediana %.3f %s (Q1 %.3f, Q3 %.3f) | media %.3f +/- %.3f | ' ...
@@ -2080,16 +2038,6 @@ for g = 1:3
                 mean(S.elapsed(~isnan(S.elapsed))), sum(S.failed)));
     end
 end
-end
-
-function save_algorithm_result(file, key, alg, S, meta)
-% Grava os resultados de um algoritmo em FINAL.<key>.<alg> sem apagar os
-% outros algoritmos da mesma arquitetura.
-F = load_results_from_mat(file, 'FINAL');
-if isfield(F, key), E = F.(key); else E = struct(); end
-E.seeds = meta.seeds;  E.lrs = meta.lrs;  E.budget = meta.budget;  E.layers = meta.layers;
-E.(alg) = S;
-save_result_to_mat(file, 'FINAL', key, E);
 end
 
 function report_results(D, P, Es, REF, N, fidT, figDir)
