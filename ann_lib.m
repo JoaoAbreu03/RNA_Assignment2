@@ -88,6 +88,7 @@ L.train_bfgs                          = @train_bfgs;
 % 8. AFINACAO DO LEARNING RATE
 L.tune_learning_rate                  = @tune_learning_rate;
 L.choose_best_learning_rate           = @choose_best_learning_rate;
+L.check_tuning_stability              = @check_tuning_stability;
 L.merge_tuning_results                = @merge_tuning_results;
 L.plot_learning_rate_tuning           = @plot_learning_rate_tuning;
 L.print_to_screen_and_file            = @print_to_screen_and_file;
@@ -1653,6 +1654,38 @@ R.lrBest = R.lrs(k);
 R.edge = (k == 1 || k == numel(R.lrs));
 end
 
+function S = check_tuning_stability(R)
+% Verifica se a escolha do learning rate depende das repeticoes usadas:
+% retira uma repeticao de cada vez, volta a escolher o lr com as restantes
+% (menor mediana da melhor perda de validacao) e compara com a escolha feita
+% com todas.
+%   S.nSame   : em quantas exclusoes a escolha se manteve
+%   S.nTotal  : numero de exclusoes (= numero de repeticoes)
+%   S.altLrs  : learning rates escolhidos quando a escolha mudou
+%   S.maxStep : maior distancia na grelha entre a escolha alternativa e a
+%               original (1 = valor vizinho)
+%   S.maxGap  : maior diferenca, na mediana com todas as repeticoes, entre a
+%               escolha alternativa e a original (perda de validacao)
+nS = size(R.bestVal, 2);
+S.nTotal = nS;
+S.nSame = 0;
+S.altLrs = [];
+S.maxStep = 0;
+S.maxGap = 0;
+for k = 1:nS
+    keep = [1:k-1, k+1:nS];
+    [mn, b] = min(median(R.bestVal(:, keep), 2));
+    if b == R.best
+        S.nSame = S.nSame + 1;
+    else
+        S.altLrs(end + 1) = R.lrs(b);
+        S.maxStep = max(S.maxStep, abs(b - R.best));
+        S.maxGap = max(S.maxGap, R.median(b) - R.median(R.best));
+    end
+end
+S.altLrs = unique(S.altLrs);
+end
+
 function R = merge_tuning_results(R, R2)
 % Junta os resultados de R2 (novos learning rates) a R, ordena por lr e volta
 % a escolher o melhor. Usado para alargar a grelha quando o escolhido fica no limite.
@@ -1727,14 +1760,12 @@ function S = train_algorithm_runs(alg, layers, P, lr, budget, seeds, logFile, un
 %   rmse, mse, mae, r2 : 1 x nRuns  (teste, unidades originais)
 %   nGrad, elapsed, bestEpoch, bestVal, failed : 1 x nRuns
 %   yhat : nTeste x nRuns (previsoes no teste, unidades originais)
-%   done : numero de runs ja feitas
 nR = numel(seeds);
 S.train = nan(budget + 1, nR);  S.val = nan(budget + 1, nR);  S.time = nan(budget + 1, nR);
 S.rmse = nan(1, nR);  S.mse = nan(1, nR);  S.mae = nan(1, nR);  S.r2 = nan(1, nR);
 S.nGrad = nan(1, nR);  S.elapsed = nan(1, nR);  S.bestEpoch = nan(1, nR);
 S.bestVal = nan(1, nR);  S.failed = false(1, nR);
 S.yhat = nan(numel(P.yteRaw), nR);
-S.done = 0;
 for r = 1:nR
     th0 = init_params(layers, seeds(r));
     o = fill_default_options(struct('budget', budget, 'seed', seeds(r), 'lr', lr));
@@ -1745,7 +1776,6 @@ for r = 1:nR
     S.rmse(r) = m.rmse;  S.mse(r) = m.mse;  S.mae(r) = m.mae;  S.r2(r) = m.r2;
     S.nGrad(r) = h.nGrad;  S.elapsed(r) = h.elapsed;  S.bestEpoch(r) = h.bestEpoch;
     S.bestVal(r) = h.bestVal;  S.failed(r) = h.failed;  S.yhat(:, r) = yh;
-    S.done = r;
     msg = sprintf('    run %2d/%d: RMSE teste %.3f %s | R2 %.3f | melhor epoch %4d | %6.1f s', ...
                   r, nR, m.rmse, unit, m.r2, h.bestEpoch, h.elapsed);
     if h.failed, msg = [msg '  [divergiu]']; end
@@ -2002,6 +2032,24 @@ for a = 1:3
         fprintf('\n');
     end
 end
+% Estabilidade da escolha: retira uma repeticao de cada vez e volta a escolher
+fprintf('\n%s - estabilidade da escolha (retirando uma repeticao de cada vez):\n', D.name);
+nSame = 0;  nTotal = 0;  maxGap = 0;  maxStep = 0;
+for a = 1:3
+    for g = 1:2
+        S = check_tuning_stability(Rs{a, g});
+        nSame = nSame + S.nSame;  nTotal = nTotal + S.nTotal;
+        maxGap = max(maxGap, S.maxGap);  maxStep = max(maxStep, S.maxStep);
+        fprintf('  %s %-4s | escolha igual em %d/%d', archs{a}, algs{g}, S.nSame, S.nTotal);
+        if S.nSame < S.nTotal
+            fprintf(' | alternativa: %s (distancia na grelha %d, perda de validacao +%.4f)', ...
+                    sprintf('%.0e ', S.altLrs), S.maxStep, S.maxGap);
+        end
+        fprintf('\n');
+    end
+end
+fprintf('  Total: escolha igual em %d/%d exclusoes (%.0f%%); quando mudou, no maximo %d posicao(oes) na grelha e +%.4f na perda de validacao\n', ...
+        nSame, nTotal, 100 * nSame / nTotal, maxStep, maxGap);
 plot_learning_rate_tuning(Rs(:, 1)', Rs(:, 2)', archNames, ['Afinacao do learning rate - ' D.name]);
 save_figure_png(['tuning_' lower(D.name)], figDir);
 end
